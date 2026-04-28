@@ -78,6 +78,8 @@ fn parse_function_csv_entry(record: &csv::StringRecord) -> Result<Info> {
     let status = match status_code {
         Some('m') => Status::NonMatchingMinor,
         Some('M') => Status::NonMatchingMajor,
+        Some('A') => Status::Matching,
+        Some('S') => Status::Matching,
         Some('O') => Status::Matching,
         Some('U') => Status::NotDecompiled,
         Some('W') => Status::Wip,
