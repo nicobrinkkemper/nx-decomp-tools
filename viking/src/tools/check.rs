@@ -9,11 +9,12 @@ use itertools::Itertools;
 use lexopt::prelude::*;
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic;
 use std::sync::Mutex;
 use viking::checks::FunctionChecker;
@@ -65,35 +66,40 @@ fn main() -> Result<()> {
     let mut decomp_symtab = None;
     let mut decomp_glob_data_table = None;
     let mut functions = None;
+    let mut plt_functions = None;
 
     rayon::scope(|s| {
         s.spawn(|_| decomp_symtab = Some(elf::make_symbol_map_by_name(&decomp_elf)));
         s.spawn(|_| decomp_glob_data_table = Some(elf::build_glob_data_table(&decomp_elf)));
         s.spawn(|_| functions = Some(functions::get_functions(version)));
+        s.spawn(|_| plt_functions = Some(elf::get_plt_functions(&orig_elf)));
     });
 
     let decomp_symtab = decomp_symtab
         .unwrap()
         .context("failed to make symbol map")?;
-
     let decomp_glob_data_table = decomp_glob_data_table
         .unwrap()
         .context("failed to make global data table")?;
 
     let functions = functions.unwrap().context("failed to load function CSV")?;
+    let plt_functions = plt_functions
+        .unwrap()
+        .context("failed to load plt functions")?;
+    let all_functions = vec![functions.clone(), plt_functions].concat();
 
     let checker = FunctionChecker::new(
         &orig_elf,
         &decomp_elf,
         &decomp_symtab,
         decomp_glob_data_table,
-        &functions,
+        &all_functions,
         version,
     )
     .context("failed to construct FunctionChecker")?;
 
     if let Some(func) = &args.function {
-        check_single(&checker, &functions, func, &args)?;
+        check_single(&checker, &functions, &all_functions, func, &args)?;
     } else {
         check_all(&checker, &functions, &args)?;
     }
@@ -171,7 +177,7 @@ All further arguments are forwarded onto asm-differ.
 asm-differ arguments:"
 );
 
-    let differ_path = repo::get_tools_path()?.join("asm-differ").join("diff.py");
+    let differ_path = get_asm_differ_path()?;
 
     // By default, invoking asm-differ using std::process:Process doesn't seem to allow argparse
     // (the python module asm-differ uses to print its help text) to correctly determine the number of columns in the host terminal.
@@ -181,7 +187,7 @@ asm-differ arguments:"
         Err(_) => 240,
     };
 
-    let output = std::process::Command::new(&differ_path)
+    let output = Command::new(&differ_path)
         .current_dir(repo::get_tools_path()?)
         .arg("--help")
         .env("COLUMNS", num_columns.to_string())
@@ -331,6 +337,7 @@ fn check_function(
 fn check_single(
     checker: &FunctionChecker,
     functions: &[functions::Info],
+    all_functions: &[functions::Info],
     fn_to_check: &str,
     args: &Args,
 ) -> Result<()> {
@@ -381,7 +388,7 @@ fn check_single(
         show_asm_differ(function, name, &args.other_args, version)?;
 
         maybe_mismatch =
-            rediff_function_after_differ(functions, &orig_fn, name, &maybe_mismatch, version)
+            rediff_function_after_differ(all_functions, &orig_fn, name, &maybe_mismatch, version)
                 .context("failed to rediff")?;
     }
 
@@ -464,14 +471,13 @@ fn check_all(checker: &FunctionChecker, functions: &[functions::Info], args: &Ar
         &new_function_statuses.lock().unwrap(),
         args.version.as_deref(),
     )
-    .with_context(|| "failed to update function statuses")?;
+    .context("failed to update function statuses")?;
 
     if failed.load(atomic::Ordering::Relaxed) {
         bail!("found at least one error");
-    } else {
-        eprintln!("{}", "OK".green().bold());
-        Ok(())
     }
+    eprintln!("{}", "OK".green().bold());
+    Ok(())
 }
 
 #[cold]
@@ -602,8 +608,8 @@ fn show_asm_differ(
     differ_args: &[String],
     version: Option<&str>,
 ) -> Result<()> {
-    let differ_path = repo::get_tools_path()?.join("asm-differ").join("diff.py");
-    let mut cmd = std::process::Command::new(&differ_path);
+    let differ_path = get_asm_differ_path()?;
+    let mut cmd = Command::new(&differ_path);
 
     cmd.current_dir(repo::get_tools_path()?)
         .arg("-I")
@@ -621,6 +627,18 @@ fn show_asm_differ(
         .with_context(|| format!("failed to launch asm-differ: {:?}", &differ_path))?;
 
     Ok(())
+}
+
+fn get_asm_differ_path() -> Result<PathBuf> {
+    let base_path = repo::get_tools_path()?;
+
+    // use the virtual env if one is setup with setup_python_venv()
+    let differ_path_venv = base_path.join(".venv/bin/asm-differ");
+    if differ_path_venv.exists() {
+        return Ok(differ_path_venv);
+    }
+
+    Ok(base_path.join("asm-differ/diff.py"))
 }
 
 fn rediff_function_after_differ(

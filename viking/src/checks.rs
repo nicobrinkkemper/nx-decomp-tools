@@ -33,7 +33,7 @@ impl KnownDataSymbolMap {
 
     fn load(&mut self, csv_path: &Path, decomp_symtab: &elf::SymbolTableByName) -> Result<()> {
         let mut reader = csv::ReaderBuilder::new()
-            .has_headers(false)
+            .has_headers(true)
             .quoting(false)
             .from_path(csv_path)?;
         for (line, maybe_record) in reader.records().enumerate() {
@@ -98,7 +98,7 @@ fn get_data_symbol_csv_path(version: Option<&str>) -> Result<PathBuf> {
 #[derive(Debug)]
 pub struct ReferenceDiff {
     pub referenced_symbol: u64,
-    pub expected_ref_in_decomp: u64,
+    pub expected_ref_in_decomp: Option<u64>,
     pub actual_ref_in_decomp: u64,
 
     pub expected_symbol_name: String,
@@ -107,17 +107,25 @@ pub struct ReferenceDiff {
 
 impl std::fmt::Display for ReferenceDiff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "incorrect reference; expected to see {ref} {ref_name}\n\
-            --> decomp source code is referencing {actual} {actual_name}\n\
-            --> expected to see {expected} to match original code",
+        writeln!(f,
+            "incorrect reference; expected to see {ref} {ref_name}",
             ref=ui::format_address(self.referenced_symbol),
             ref_name=ui::format_symbol_name(&self.expected_symbol_name),
-            expected=ui::format_address(self.expected_ref_in_decomp),
-            actual=ui::format_address(self.actual_ref_in_decomp),
-            actual_name=ui::format_symbol_name(&self.actual_symbol_name),
-        )
+        )?;
+        writeln!(
+            f,
+            "--> decomp source code is referencing {actual} {actual_name}",
+            actual = ui::format_address(self.actual_ref_in_decomp),
+            actual_name = ui::format_symbol_name(&self.actual_symbol_name),
+        )?;
+        if let Some(expected) = self.expected_ref_in_decomp {
+            writeln!(
+                f,
+                "--> expected to see {expected} to match original code",
+                expected = ui::format_address(expected),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -131,6 +139,7 @@ pub enum MismatchCause {
     DataReference(ReferenceDiff),
     Immediate,
     Unknown,
+    InternalError(String),
 }
 
 impl std::fmt::Display for MismatchCause {
@@ -144,6 +153,7 @@ impl std::fmt::Display for MismatchCause {
             Self::DataReference(diff) => write!(f, "wrong data reference\n{diff}"),
             Self::Immediate => write!(f, "wrong immediate"),
             Self::Unknown => write!(f, "unknown reason"),
+            Self::InternalError(msg) => write!(f, "internal error: {}", msg),
         }
     }
 }
@@ -170,6 +180,7 @@ pub struct FunctionChecker<'a, 'functions, 'orig_elf, 'decomp_elf> {
     pub decomp_elf: &'decomp_elf elf::OwnedElf,
     pub decomp_symtab: &'a elf::SymbolTableByName<'decomp_elf>,
     decomp_glob_data_table: elf::GlobDataTable,
+    decomp_plt_section: Option<&'decomp_elf goblin::elf::SectionHeader>,
 
     // Optional, only initialized when a mismatch is detected.
     decomp_addr_to_name_map: Lazy<elf::AddrToNameMap<'decomp_elf>>,
@@ -197,12 +208,14 @@ impl<'a, 'functions, 'orig_elf, 'decomp_elf>
 
         let known_functions = functions::make_known_function_map(functions);
 
+        let decomp_plt_section = elf::find_section(decomp_elf, ".plt").ok();
         let orig_got_section = elf::find_section(orig_elf, ".got").ok();
 
         Ok(FunctionChecker {
             decomp_elf,
             decomp_symtab,
             decomp_glob_data_table,
+            decomp_plt_section,
             decomp_addr_to_name_map: Lazy::new(),
 
             known_data_symbols,
@@ -417,24 +430,64 @@ impl<'a, 'functions, 'orig_elf, 'decomp_elf>
 
     /// Returns None on success and a MismatchCause on failure.
     fn check_function_call(&self, orig_addr: u64, decomp_addr: u64) -> Option<MismatchCause> {
-        let info = *self.known_functions.get(&orig_addr)?;
+        if !repo::get_config()
+            .check_unimplemented_references
+            .unwrap_or(true)
+        {
+            // 0x10 = size of one plt entry
+            if elf::is_in_section(self.decomp_plt_section?, decomp_addr, 0x10) {
+                // we are deliberately ignoring PLT references, so do not check their target
+                return None;
+            }
+        }
+
+        let Some(info) = self.known_functions.get(&orig_addr) else {
+            // should not happen, but loudly complain (and only fail single function) if it still happens
+            return Some(MismatchCause::InternalError(format!(
+                "failed to resolve orig function at address {:x}",
+                orig_addr
+            )));
+        };
         let name = info.name.as_str();
-        let decomp_symbol = self.decomp_symtab.get(name)?;
-        let expected = decomp_symbol.st_value;
-
-        if decomp_addr == expected {
-            None
-        } else {
+        if name.is_empty() {
+            // called some function that is not named in the binary or function list
             let actual_symbol_name = self.translate_decomp_addr_to_name(decomp_addr);
-
-            Some(MismatchCause::FunctionCall(ReferenceDiff {
+            return Some(MismatchCause::FunctionCall(ReferenceDiff {
                 referenced_symbol: orig_addr,
-                expected_ref_in_decomp: expected,
+                expected_ref_in_decomp: None,
+                actual_ref_in_decomp: decomp_addr,
+                expected_symbol_name: "<unnamed function>".to_string(),
+                actual_symbol_name: actual_symbol_name.unwrap_or("unknown").to_string(),
+            }));
+        }
+        let Some(expected) = self
+            .decomp_symtab
+            .get(name)
+            .map(|sym| sym.st_value)
+            .or_else(|| elf::plt_name_to_addr(self.decomp_elf, name))
+        else {
+            let actual_symbol_name = self.translate_decomp_addr_to_name(decomp_addr);
+            return Some(MismatchCause::FunctionCall(ReferenceDiff {
+                referenced_symbol: orig_addr,
+                expected_ref_in_decomp: None,
                 actual_ref_in_decomp: decomp_addr,
                 expected_symbol_name: name.to_string(),
                 actual_symbol_name: actual_symbol_name.unwrap_or("unknown").to_string(),
-            }))
+            }));
+        };
+
+        if decomp_addr != expected {
+            let actual_symbol_name = self.translate_decomp_addr_to_name(decomp_addr);
+            return Some(MismatchCause::FunctionCall(ReferenceDiff {
+                referenced_symbol: orig_addr,
+                expected_ref_in_decomp: Some(expected),
+                actual_ref_in_decomp: decomp_addr,
+                expected_symbol_name: name.to_string(),
+                actual_symbol_name: actual_symbol_name.unwrap_or("unknown").to_string(),
+            }));
         }
+
+        None
     }
 
     /// Returns None on success and a MismatchCause on failure.
@@ -454,7 +507,7 @@ impl<'a, 'functions, 'orig_elf, 'decomp_elf>
 
             Some(MismatchCause::DataReference(ReferenceDiff {
                 referenced_symbol: orig_addr,
-                expected_ref_in_decomp: expected,
+                expected_ref_in_decomp: Some(expected),
                 actual_ref_in_decomp: decomp_addr,
                 expected_symbol_name: symbol.name.to_string(),
                 actual_symbol_name: actual_symbol_name.unwrap_or("unknown").to_string(),
@@ -511,6 +564,8 @@ impl<'a, 'functions, 'orig_elf, 'decomp_elf>
             let map = elf::make_addr_to_name_map(self.decomp_elf).ok();
             map.unwrap_or_default()
         });
-        map.get(&decomp_addr).copied()
+        map.get(&decomp_addr)
+            .copied()
+            .or_else(|| elf::plt_addr_to_name(self.decomp_elf, decomp_addr))
     }
 }

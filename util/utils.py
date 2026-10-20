@@ -46,9 +46,13 @@ _markers = {
     "L": FunctionStatus.NotDecompiled,
 }
 
+# Project-specific codes from tools/config.toml, each an alias of a built-in code (e.g. A = "O").
+_status_code_aliases = config.CONFIG.get("status_codes", {})
+
 
 def parse_function_csv_entry(row) -> FunctionInfo:
     ea, stat, size, name = row
+    stat = _status_code_aliases.get(stat, stat)
     status = _markers.get(stat, FunctionStatus.NotDecompiled)
     decomp_name = ""
 
@@ -124,7 +128,7 @@ def print_error(msg: str, prefix: str = ""):
     sys.stderr.write(f"{Style.BRIGHT}{prefix}{Fore.RED}error:{Fore.RESET} {msg}{Style.RESET_ALL}\n")
 
 
-def fail(msg: str, prefix: str = ""):
+def fail(msg: str, prefix: str = "") -> tp.NoReturn:
     print_error(msg, prefix)
     sys.exit(1)
 

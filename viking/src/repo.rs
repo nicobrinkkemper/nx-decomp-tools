@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use lazy_static::lazy_static;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(serde::Deserialize)]
@@ -8,6 +9,10 @@ pub struct Config {
     pub functions_csv: String,
     pub default_version: Option<String>,
     pub decomp_me: Option<ConfigDecompMe>,
+    pub check_unimplemented_references: Option<bool>,
+    /// Extra quality codes for the functions CSV, each an alias of a built-in code
+    /// (e.g. `A = "O"`). The original code is kept when the CSV is written back.
+    pub status_codes: Option<HashMap<String, String>>,
 }
 
 #[derive(serde::Deserialize)]

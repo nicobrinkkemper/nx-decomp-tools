@@ -18,6 +18,29 @@ pub enum Status {
 }
 
 impl Status {
+    fn from_builtin_code(code: char) -> Option<Status> {
+        match code {
+            'm' => Some(Status::NonMatchingMinor),
+            'M' => Some(Status::NonMatchingMajor),
+            'O' => Some(Status::Matching),
+            'U' => Some(Status::NotDecompiled),
+            'W' => Some(Status::Wip),
+            'L' => Some(Status::Library),
+            _ => None,
+        }
+    }
+
+    fn builtin_code(&self) -> char {
+        match self {
+            Status::Matching => 'O',
+            Status::NonMatchingMinor => 'm',
+            Status::NonMatchingMajor => 'M',
+            Status::NotDecompiled => 'U',
+            Status::Wip => 'W',
+            Status::Library => 'L',
+        }
+    }
+
     pub fn description(&self) -> &'static str {
         match &self {
             Status::Matching => "matching",
@@ -36,6 +59,8 @@ pub struct Info {
     pub size: u32,
     pub name: String,
     pub status: Status,
+    /// Project-specific status code from the CSV (see `StatusCodes`), if one was used.
+    pub status_code: Option<char>,
 }
 
 impl Info {
@@ -49,6 +74,49 @@ impl Info {
 
     pub fn get_end(&self) -> u64 {
         self.get_start() + self.size as u64
+    }
+}
+
+/// Extra status codes declared in the `[status_codes]` table of tools/config.toml.
+/// Each one is an alias of a built-in code.
+pub type StatusCodes = FxHashMap<char, Status>;
+
+pub fn parse_status_codes<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<StatusCodes> {
+    let mut codes = StatusCodes::default();
+    for (code, target) in entries {
+        let mut chars = code.chars();
+        let (Some(code), None) = (chars.next(), chars.next()) else {
+            bail!("status code {code:?} must be a single character");
+        };
+        ensure!(
+            Status::from_builtin_code(code).is_none(),
+            "status code {code:?} is a built-in code and cannot be redefined"
+        );
+        let mut chars = target.chars();
+        let status = match (chars.next(), chars.next()) {
+            (Some(target), None) => Status::from_builtin_code(target),
+            _ => None,
+        }
+        .with_context(|| {
+            format!("status code {code:?} must alias one of the built-in codes O, m, M, U, W, L")
+        })?;
+        codes.insert(code, status);
+    }
+    Ok(codes)
+}
+
+/// Returns the extra status codes declared in tools/config.toml.
+pub fn get_status_codes() -> Result<StatusCodes> {
+    match &repo::get_config().status_codes {
+        Some(entries) => parse_status_codes(
+            entries
+                .iter()
+                .map(|(code, target)| (code.as_str(), target.as_str())),
+        )
+        .context("invalid [status_codes] in tools/config.toml"),
+        None => Ok(StatusCodes::default()),
     }
 }
 
@@ -67,7 +135,7 @@ pub fn parse_address(value: &str) -> Result<u64> {
     Ok(parse_base_16(value)? - ADDRESS_BASE)
 }
 
-fn parse_function_csv_entry(record: &csv::StringRecord) -> Result<Info> {
+fn parse_function_csv_entry(record: &csv::StringRecord, extra_codes: &StatusCodes) -> Result<Info> {
     ensure!(record.len() == 4, "invalid record");
 
     let addr = parse_address(&record[0])?;
@@ -75,16 +143,14 @@ fn parse_function_csv_entry(record: &csv::StringRecord) -> Result<Info> {
     let size = record[2].parse::<u32>()?;
     let decomp_name = record[3].to_string();
 
-    let status = match status_code {
-        Some('m') => Status::NonMatchingMinor,
-        Some('M') => Status::NonMatchingMajor,
-        Some('A') => Status::Matching,
-        Some('S') => Status::Matching,
-        Some('O') => Status::Matching,
-        Some('U') => Status::NotDecompiled,
-        Some('W') => Status::Wip,
-        Some('L') => Status::Library,
-        Some(code) => bail!("unexpected status code: {}", code),
+    let (status, status_code) = match status_code {
+        Some(code) => match Status::from_builtin_code(code) {
+            Some(status) => (status, None),
+            None => match extra_codes.get(&code) {
+                Some(status) => (status.clone(), Some(code)),
+                None => bail!("unexpected status code: {}", code),
+            },
+        },
         None => bail!("missing status code"),
     };
 
@@ -93,6 +159,7 @@ fn parse_function_csv_entry(record: &csv::StringRecord) -> Result<Info> {
         size,
         name: decomp_name,
         status,
+        status_code,
     })
 }
 
@@ -139,7 +206,7 @@ fn check_for_overlapping_functions(functions: &[Info]) -> Result<()> {
 }
 
 /// Returns a Vec of all functions that are listed in the specified CSV.
-pub fn get_functions_for_path(csv_path: &Path) -> Result<Vec<Info>> {
+pub fn get_functions_for_path(csv_path: &Path, extra_codes: &StatusCodes) -> Result<Vec<Info>> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .quoting(false)
@@ -160,7 +227,7 @@ pub fn get_functions_for_path(csv_path: &Path) -> Result<Vec<Info>> {
     }
 
     while reader.read_record(&mut record)? {
-        let entry = parse_function_csv_entry(&record)
+        let entry = parse_function_csv_entry(&record, extra_codes)
             .with_context(|| format!("failed to parse CSV record at line {line_number}"))?;
 
         if !entry.name.is_empty() {
@@ -177,19 +244,20 @@ pub fn get_functions_for_path(csv_path: &Path) -> Result<Vec<Info>> {
     Ok(result)
 }
 
-pub fn write_functions_to_path(csv_path: &Path, functions: &[Info]) -> Result<()> {
+pub fn write_functions_to_path(
+    csv_path: &Path,
+    functions: &[Info],
+    extra_codes: &StatusCodes,
+) -> Result<()> {
     let mut writer = csv::Writer::from_path(csv_path)?;
     writer.write_record(CSV_HEADER)?;
 
     for function in functions {
         let addr = format!("0x{:016x}", function.get_start());
-        let status = match function.status {
-            Status::Matching => "O",
-            Status::NonMatchingMinor => "m",
-            Status::NonMatchingMajor => "M",
-            Status::NotDecompiled => "U",
-            Status::Wip => "W",
-            Status::Library => "L",
+        // Keep a project-specific code as long as the status it stands for is unchanged.
+        let status = match function.status_code {
+            Some(code) if extra_codes.get(&code) == Some(&function.status) => code,
+            _ => function.status.builtin_code(),
         }
         .to_string();
         let size = format!("{:06}", function.size);
@@ -213,11 +281,18 @@ pub fn get_functions_csv_path(version: Option<&str>) -> PathBuf {
 
 /// Returns a Vec of all known functions in the executable.
 pub fn get_functions(version: Option<&str>) -> Result<Vec<Info>> {
-    get_functions_for_path(get_functions_csv_path(version).as_path())
+    get_functions_for_path(
+        get_functions_csv_path(version).as_path(),
+        &get_status_codes()?,
+    )
 }
 
 pub fn write_functions(functions: &[Info], version: Option<&str>) -> Result<()> {
-    write_functions_to_path(get_functions_csv_path(version).as_path(), functions)
+    write_functions_to_path(
+        get_functions_csv_path(version).as_path(),
+        functions,
+        &get_status_codes()?,
+    )
 }
 
 pub fn make_known_function_map(functions: &[Info]) -> FxHashMap<u64, &Info> {
@@ -225,9 +300,6 @@ pub fn make_known_function_map(functions: &[Info]) -> FxHashMap<u64, &Info> {
         FxHashMap::with_capacity_and_hasher(functions.len(), Default::default());
 
     for function in functions {
-        if function.name.is_empty() {
-            continue;
-        }
         known_functions.insert(function.addr, function);
     }
 
@@ -292,4 +364,89 @@ pub fn filter_candidates_by_symtab<'a>(
         .iter()
         .filter(|function| decomp_symtab.contains_key(function.name.as_str()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extra_codes() -> StatusCodes {
+        parse_status_codes([("A", "O"), ("S", "O"), ("w", "W")]).unwrap()
+    }
+
+    const CSV: &str = "Address,Quality,Size,Name
+0x0000007100000000,O,000016,f0
+0x0000007100000010,A,000016,f1
+0x0000007100000020,S,000016,f2
+0x0000007100000030,w,000016,f3
+0x0000007100000040,U,000016,
+";
+
+    #[test]
+    fn extra_codes_alias_builtin_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.csv");
+        std::fs::write(&path, CSV).unwrap();
+
+        let functions = get_functions_for_path(&path, &extra_codes()).unwrap();
+        let statuses: Vec<_> = functions.iter().map(|f| f.status.clone()).collect();
+        assert_eq!(
+            statuses,
+            [
+                Status::Matching,
+                Status::Matching,
+                Status::Matching,
+                Status::Wip,
+                Status::NotDecompiled
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_code_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.csv");
+        std::fs::write(&path, CSV).unwrap();
+
+        let err = get_functions_for_path(&path, &StatusCodes::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("unexpected status code: A"));
+    }
+
+    #[test]
+    fn extra_codes_survive_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.csv");
+        std::fs::write(&path, CSV).unwrap();
+        let codes = extra_codes();
+
+        let functions = get_functions_for_path(&path, &codes).unwrap();
+        write_functions_to_path(&path, &functions, &codes).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CSV);
+    }
+
+    #[test]
+    fn changed_status_falls_back_to_builtin_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("functions.csv");
+        std::fs::write(&path, CSV).unwrap();
+        let codes = extra_codes();
+
+        let mut functions = get_functions_for_path(&path, &codes).unwrap();
+        functions[1].status = Status::NonMatchingMajor;
+        functions[3].status = Status::Matching;
+        write_functions_to_path(&path, &functions, &codes).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("0x0000007100000010,M,000016,f1"));
+        assert!(written.contains("0x0000007100000020,S,000016,f2"));
+        assert!(written.contains("0x0000007100000030,O,000016,f3"));
+    }
+
+    #[test]
+    fn invalid_status_codes_are_rejected() {
+        assert!(parse_status_codes([("O", "M")]).is_err());
+        assert!(parse_status_codes([("AB", "O")]).is_err());
+        assert!(parse_status_codes([("A", "X")]).is_err());
+        assert!(parse_status_codes([("A", "matching")]).is_err());
+    }
 }
