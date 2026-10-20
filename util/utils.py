@@ -39,8 +39,6 @@ _markers = {
     "O": FunctionStatus.Matching,
     "m": FunctionStatus.Equivalent,
     "M": FunctionStatus.NonMatching,
-    "A": FunctionStatus.Matching,
-    "S": FunctionStatus.Matching,
     "W": FunctionStatus.Wip,
     "U": FunctionStatus.NotDecompiled,
     "L": FunctionStatus.NotDecompiled,
