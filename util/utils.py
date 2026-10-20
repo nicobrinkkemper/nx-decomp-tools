@@ -44,9 +44,13 @@ _markers = {
     "L": FunctionStatus.NotDecompiled,
 }
 
+# Project-specific codes from tools/config.toml, each an alias of a built-in code (e.g. A = "O").
+_status_code_aliases = config.CONFIG.get("status_codes", {})
+
 
 def parse_function_csv_entry(row) -> FunctionInfo:
     ea, stat, size, name = row
+    stat = _status_code_aliases.get(stat, stat)
     status = _markers.get(stat, FunctionStatus.NotDecompiled)
     decomp_name = ""
 

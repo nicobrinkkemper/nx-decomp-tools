@@ -329,6 +329,7 @@ pub fn get_plt_functions(elf: &OwnedElf) -> Result<Vec<crate::functions::Info>> 
             size: 0x10,
             name: name.to_string(),
             status: Status::Library,
+            status_code: None,
         });
     }
 
