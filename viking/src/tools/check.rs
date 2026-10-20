@@ -86,7 +86,17 @@ fn main() -> Result<()> {
     let plt_functions = plt_functions
         .unwrap()
         .context("failed to load plt functions")?;
-    let all_functions = vec![functions.clone(), plt_functions].concat();
+    // A PLT entry the function list already names keeps the list's name.
+    let listed: HashSet<u64> = functions.iter().map(|f| f.addr).collect();
+    let all_functions: Vec<_> = functions
+        .iter()
+        .cloned()
+        .chain(
+            plt_functions
+                .into_iter()
+                .filter(|f| !listed.contains(&f.addr)),
+        )
+        .collect();
 
     let checker = FunctionChecker::new(
         &orig_elf,
